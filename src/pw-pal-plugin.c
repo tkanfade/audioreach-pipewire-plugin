@@ -34,6 +34,7 @@
 #include <PalApi.h>
 #include <PalDefs.h>
 #include <agm/agm_api.h>
+#include <pthread.h>
 #include "SoundTriggerUtils.h"
 
 
@@ -146,6 +147,16 @@ struct pw_userdata {
     int jack_fd;
     char jack_name[MAX_NAME_LENGTH];
 
+    /* capture reader thread */
+    pthread_t       reader_thread;
+    bool            reader_running;
+    uint8_t        *ring_buf;
+    uint32_t        ring_size;      /* must be power-of-two */
+    uint32_t        ring_write;     /* written by reader thread */
+    uint32_t        ring_read;      /* read   by RT process()  */
+    pthread_mutex_t ring_mutex;
+    pthread_cond_t  ring_cond;
+
     bool is_sva;                        
     enum sva_state sva_state;           
     pal_stream_handle_t *sva_pal_handle;
@@ -178,6 +189,66 @@ static int32_t pa_pal_out_cb(pal_stream_handle_t *stream_handle,
 
     return 0;
 }
+static void *pw_pal_reader_thread(void *arg)
+{
+    struct pw_userdata *udata = arg;
+    struct pal_buffer pal_buf;
+    uint8_t *tmp;
+    uint32_t buf_size = udata->source_buf_size;
+
+    tmp = malloc(buf_size);
+    if (!tmp) {
+        pw_log_error("reader thread: malloc failed");
+        return NULL;
+    }
+
+    pw_log_info("reader thread started, buf_size=%u ring_size=%u",
+                buf_size, udata->ring_size);
+
+    while (udata->reader_running) {
+        memset(&pal_buf, 0, sizeof(pal_buf));
+        pal_buf.buffer = tmp;
+        pal_buf.size   = buf_size;
+
+        int rc = pal_stream_read(udata->stream_handle, &pal_buf);
+        if (rc < 0) {
+            pw_log_error("reader thread: pal_stream_read error %d", rc);
+            /* brief sleep to avoid busy-loop on persistent error */
+            usleep(5000);
+            continue;
+        }
+
+        uint32_t got = (pal_buf.size > 0) ? pal_buf.size : buf_size;
+        if (pal_buf.size == 0)
+            memset(tmp, 0, got); /* fill silence if PAL returned nothing */
+
+        pthread_mutex_lock(&udata->ring_mutex);
+        /* write into ring buffer; drop oldest data if full */
+        uint32_t used = (udata->ring_write - udata->ring_read) &
+                        (udata->ring_size - 1);
+        uint32_t free_space = udata->ring_size - used - 1;
+        if (got > free_space) {
+            /* advance read pointer to make room (drop oldest) */
+            udata->ring_read += (got - free_space);
+        }
+        uint32_t w = udata->ring_write & (udata->ring_size - 1);
+        uint32_t tail = udata->ring_size - w;
+        if (got <= tail) {
+            memcpy(udata->ring_buf + w, tmp, got);
+        } else {
+            memcpy(udata->ring_buf + w, tmp, tail);
+            memcpy(udata->ring_buf, tmp + tail, got - tail);
+        }
+        udata->ring_write += got;
+        pthread_cond_signal(&udata->ring_cond);
+        pthread_mutex_unlock(&udata->ring_mutex);
+    }
+
+    free(tmp);
+    pw_log_info("reader thread exited");
+    return NULL;
+}
+
 static void pw_pal_set_volume (struct pw_userdata *udata, float gain)
 {
     int rc = 0, i;
@@ -1011,6 +1082,15 @@ static int close_pal_stream(struct pw_userdata *udata)
     }
 
     if (udata->stream_handle) {
+        if (!udata->isplayback && udata->reader_running) {
+            udata->reader_running = false;
+            pthread_join(udata->reader_thread, NULL);
+            free(udata->ring_buf);
+            udata->ring_buf = NULL;
+            pthread_mutex_destroy(&udata->ring_mutex);
+            pthread_cond_destroy(&udata->ring_cond);
+            pw_log_info("capture reader thread stopped");
+        }
         rc = pal_stream_stop(udata->stream_handle);
         if (rc) {
             pw_log_error("pal_stream_stop failed for %p error %d", udata->stream_handle, rc);
@@ -1056,14 +1136,43 @@ static void pw_pal_stream_start(struct pw_userdata *udata)
         pw_log_error("pal_stream_set_buffer_size failed\n");
         goto cleanup;
     }
-    rc = pal_stream_start(udata->stream_handle);
-    if (rc) {
-        pw_log_error("pal_stream_start failed, error %d\n", rc);
-        goto cleanup;
+    if (!udata->isplayback) {
+        /* capture: start synchronously then launch reader thread */
+        rc = pal_stream_start(udata->stream_handle);
+        if (rc) {
+            pw_log_error("pal_stream_start failed, error %d\n", rc);
+            goto cleanup;
         }
-    if (udata->isplayback) {
-        pw_log_error("pal_stream_start set volume, error %d\n", rc);
+    } else {
+        /* playback: start synchronously and set volume */
+        rc = pal_stream_start(udata->stream_handle);
+        if (rc) {
+            pw_log_error("pal_stream_start failed, error %d\n", rc);
+            goto cleanup;
+        }
         pw_pal_set_volume(udata, 1.0);
+    }
+
+    if (!udata->isplayback) {
+        /* allocate ring buffer: 8x PAL buffer size, rounded to power-of-two */
+        uint32_t ring_sz = udata->source_buf_size * 8;
+        /* round up to next power of two */
+        ring_sz--;
+        ring_sz |= ring_sz >> 1;
+        ring_sz |= ring_sz >> 2;
+        ring_sz |= ring_sz >> 4;
+        ring_sz |= ring_sz >> 8;
+        ring_sz |= ring_sz >> 16;
+        ring_sz++;
+        udata->ring_buf   = calloc(1, ring_sz);
+        udata->ring_size  = ring_sz;
+        udata->ring_write = 0;
+        udata->ring_read  = 0;
+        pthread_mutex_init(&udata->ring_mutex, NULL);
+        pthread_cond_init(&udata->ring_cond, NULL);
+        udata->reader_running = true;
+        pthread_create(&udata->reader_thread, NULL, pw_pal_reader_thread, udata);
+        pw_log_info("capture reader thread launched, ring_size=%u", ring_sz);
     }
 
     return;
@@ -1114,7 +1223,6 @@ static void pw_pal_process_stream(void *d)
     uint32_t offs, size;
     struct pal_buffer pal_buf;
     int rc = 0;
-    static int tmp = 0;
 
     if ((buf = pw_stream_dequeue_buffer(udata->stream)) == NULL) {
         pw_log_error("out of buffers: %m");
@@ -1137,25 +1245,35 @@ static void pw_pal_process_stream(void *d)
             }
         }
     } else {
-          data = bd->data;
-          size = buf->requested ? buf->requested * udata->frame_size : bd->maxsize;
+        uint32_t quantum_size = buf->requested ? buf->requested * udata->frame_size : bd->maxsize;
+        uint32_t avail, to_copy;
 
-          pal_buf.buffer = data;
-          pal_buf.size = size;
+        data = bd->data;
 
-          if (udata->stream_handle && !udata->is_sva) {
-              if ((rc = pal_stream_read(udata->stream_handle, &pal_buf)) < 0) {
-                  pw_log_error("Could not read data: %d %d", rc, __LINE__);
-                  size = 0;
-              }
-          } else {
-              size = 0;
-          }
+        /* Copy from ring buffer filled by the reader thread (non-blocking) */
+        pthread_mutex_lock(&udata->ring_mutex);
+        avail = (udata->ring_write - udata->ring_read) & (udata->ring_size - 1);
+        to_copy = SPA_MIN(avail, quantum_size);
+        if (to_copy > 0) {
+            uint32_t r = udata->ring_read & (udata->ring_size - 1);
+            uint32_t tail = udata->ring_size - r;
+            if (to_copy <= tail) {
+                memcpy(data, udata->ring_buf + r, to_copy);
+            } else {
+                memcpy(data, udata->ring_buf + r, tail);
+                memcpy((uint8_t *)data + tail, udata->ring_buf, to_copy - tail);
+            }
+            udata->ring_read += to_copy;
+        }
+        pthread_mutex_unlock(&udata->ring_mutex);
 
-          bd->chunk->size = size;
-          bd->chunk->stride = udata->frame_size;
-          bd->chunk->offset = 0;
-          buf->size = udata->frame_size ? size / udata->frame_size : 0;
+        if (to_copy < quantum_size)
+            memset((uint8_t *)data + to_copy, 0, quantum_size - to_copy);
+
+        bd->chunk->size   = quantum_size;
+        bd->chunk->stride = udata->frame_size;
+        bd->chunk->offset = 0;
+        buf->size = quantum_size / udata->frame_size;
     }
 
     /* write buffer contents here */

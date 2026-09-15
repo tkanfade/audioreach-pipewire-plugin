@@ -147,6 +147,11 @@ struct pw_userdata {
     int jack_fd;
     char jack_name[MAX_NAME_LENGTH];
 
+    /* playback starter thread */
+    pthread_t       starter_thread;
+    volatile bool   stream_ready;     /* set true once pal_stream_start returns */
+    volatile bool   stop_requested;   /* set true when stream must stop */
+
     /* capture reader thread */
     pthread_t       reader_thread;
     bool            reader_running;
@@ -173,22 +178,7 @@ struct pw_userdata {
 
 static void sva_set_state(struct pw_userdata *udata, enum sva_state next_state);
 static void sva_emit_props_changed(struct pw_userdata *udata);
-static int close_pal_stream(struct pw_userdata *udata);
-
-static void pw_pal_destroy_stream(void *d)
-{
-    struct pw_userdata *udata = d;
-
-    spa_hook_remove(&udata->stream_listener);
-    udata->stream = NULL;
-}
-
-static int32_t pa_pal_out_cb(pal_stream_handle_t *stream_handle,
-                            uint32_t event_id, uint32_t *event_data,
-                            uint32_t event_size, uint64_t cookie) {
-
-    return 0;
-}
+static void pw_pal_set_volume(struct pw_userdata *udata, float gain);
 static void *pw_pal_reader_thread(void *arg)
 {
     struct pw_userdata *udata = arg;
@@ -249,6 +239,44 @@ static void *pw_pal_reader_thread(void *arg)
     return NULL;
 }
 
+
+static void *pw_pal_starter_thread(void *arg)
+{
+    struct pw_userdata *udata = arg;
+    int rc;
+
+    pw_log_info("starter thread: calling pal_stream_start");
+    rc = pal_stream_start(udata->stream_handle);
+    if (rc)
+        pw_log_warn("starter thread: pal_stream_start failed %d", rc);
+    else
+        pw_log_info("starter thread: pal_stream_start done, stream ready");
+    if (!rc && !udata->stop_requested)
+        pw_pal_set_volume(udata, 1.0);
+
+    /* volume set must happen after stream is started */
+    __sync_synchronize();          /* memory barrier before flag publish */
+    udata->stream_ready = true;
+    return NULL;
+}
+
+
+static int close_pal_stream(struct pw_userdata *udata);
+
+static void pw_pal_destroy_stream(void *d)
+{
+    struct pw_userdata *udata = d;
+
+    spa_hook_remove(&udata->stream_listener);
+    udata->stream = NULL;
+}
+
+static int32_t pa_pal_out_cb(pal_stream_handle_t *stream_handle,
+                            uint32_t event_id, uint32_t *event_data,
+                            uint32_t event_size, uint64_t cookie) {
+
+    return 0;
+}
 static void pw_pal_set_volume (struct pw_userdata *udata, float gain)
 {
     int rc = 0, i;
@@ -1082,6 +1110,14 @@ static int close_pal_stream(struct pw_userdata *udata)
     }
 
     if (udata->stream_handle) {
+        if (udata->isplayback && !udata->stream_ready) {
+            /* starter thread still running inside pal_stream_start.
+             * Signal it to skip volume and exit quickly, then
+             * pal_stream_stop below will unblock it. */
+            udata->stop_requested = true;
+            __sync_synchronize();
+            pw_log_info("playback: stop requested while starter thread running");
+        }
         if (!udata->isplayback && udata->reader_running) {
             udata->reader_running = false;
             pthread_join(udata->reader_thread, NULL);
@@ -1144,13 +1180,16 @@ static void pw_pal_stream_start(struct pw_userdata *udata)
             goto cleanup;
         }
     } else {
-        /* playback: start synchronously and set volume */
-        rc = pal_stream_start(udata->stream_handle);
-        if (rc) {
-            pw_log_error("pal_stream_start failed, error %d\n", rc);
-            goto cleanup;
-        }
-        pw_pal_set_volume(udata, 1.0);
+        /* playback: start asynchronously so RT thread is never blocked.
+         * process() will send silence until stream_ready becomes true. */
+        udata->stream_ready   = false;
+        udata->stop_requested = false;
+        __sync_synchronize();
+        pthread_create(&udata->starter_thread, NULL,
+                       pw_pal_starter_thread, udata);
+        /* detach: thread cleans itself up, we never join on main thread */
+        pthread_detach(udata->starter_thread);
+        pw_log_info("playback starter thread launched (detached)");
     }
 
     if (!udata->isplayback) {
@@ -1235,6 +1274,14 @@ static void pw_pal_process_stream(void *d)
         offs = SPA_MIN(bd->chunk->offset, bd->maxsize);
         size = SPA_MIN(bd->chunk->size, bd->maxsize - offs);
         data = SPA_PTROFF(bd->data, offs, void);
+
+
+        /* wait until pal_stream_start has returned in the starter thread */
+        if (!udata->stream_ready) {
+            /* stream not ready yet - drop this buffer silently */
+            pw_stream_queue_buffer(udata->stream, buf);
+            return;
+        }
 
         pal_buf.buffer = data;
         pal_buf.size = size;

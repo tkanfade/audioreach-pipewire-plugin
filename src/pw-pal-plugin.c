@@ -58,6 +58,7 @@ PW_LOG_TOPIC_STATIC(log_topic, "log:" LOG_TAG);
 #define DEV_INPUT_DIR "/dev/input"
 #define FILE_PREFIX "event"
 #define MAX_DEVICES 4
+#define PW_DEFAULT_CAPTURE_QUANTUM_FRAMES 1024
 #define SVA_DEBUG_DUMP_LOCATION "/tmp"
 #define SVA_SOURCE_BUF_SIZE 512
 #define SVA_SOURCE_BUF_COUNT 8
@@ -1614,8 +1615,8 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
                 udata->stream_attributes->in_media_config.ch_info.ch_map[3] = PAL_CHMAP_CHANNEL_RB;
             }
 
-            udata->source_buf_size  = 512;
-            udata->source_buf_count = 8;
+            udata->source_buf_size = PW_DEFAULT_CAPTURE_QUANTUM_FRAMES * udata->frame_size;
+            udata->source_buf_count = 4;
         } else {
             udata->stream_attributes->in_media_config.sample_rate  = udata->sva_cfg.sample_rate;
             udata->stream_attributes->in_media_config.bit_width    = SVA_BIT_WIDTH;

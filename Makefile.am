@@ -6,9 +6,9 @@ AM_CFLAGS = -Wno-unused-parameter -Wno-unused-result
 
 lib_LTLIBRARIES      = libpipewire-module-pal.la
 libpipewire_module_pal_la_SOURCES   = src/pw-pal-plugin.c
-libpipewire_module_pal_la_CFLAGS = $(AM_CFLAGS) $(PALHEADERS_CFLAGS) $(VUIINTFHEADER_CFLAGS) @PIPEWIRE_CFLAGS@
+libpipewire_module_pal_la_CFLAGS = $(AM_CFLAGS) @PAL_CFLAGS@ $(VUIINTFHEADER_CFLAGS) @PIPEWIRE_CFLAGS@
 libpipewire_module_pal_la_LDFLAGS   = -shared -avoid-version
-libpipewire_module_pal_la_LIBADD   = -ltinyalsa -ldl -lexpat -lpal -lagm
+libpipewire_module_pal_la_LIBADD   = -ltinyalsa -ldl -lexpat @PAL_LIBS@ -lagm
 
 install-exec-hook:
 	mkdir -p $(DESTDIR)/usr/lib/pipewire-0.3
